@@ -1,0 +1,81 @@
+name: CoReview External Review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+# Chỉ chạy khi PR không còn draft (nếu team dùng draft PR)
+concurrency:
+  group: coreview-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  trigger-external-review:
+    name: Trigger CoReview external review
+    runs-on: ubuntu-latest
+    # Bỏ if này nếu muốn review cả draft PR
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - name: Trigger external review via CoReview API
+        env:
+          COREVIEW_API_URL: ${{ secrets.COREVIEW_API_URL }}
+          COREVIEW_TRIGGER_TOKEN: ${{ secrets.COREVIEW_TRIGGER_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${COREVIEW_API_URL}" ] || [ -z "${COREVIEW_TRIGGER_TOKEN}" ]; then
+            echo "Missing COREVIEW_API_URL or COREVIEW_TRIGGER_TOKEN secret"
+            exit 1
+          fi
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPOSITORY="${{ github.repository }}"
+          ACTION="${{ github.event.action }}"
+          RUN_ID="${{ github.run_id }}"
+
+          # opened / reopened / synchronize / ready_for_review
+          # API default action là "opened" nếu không gửi — map synchronize → opened
+          TRIGGER_ACTION="opened"
+          if [ "${ACTION}" = "reopened" ]; then
+            TRIGGER_ACTION="reopened"
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg provider "github" \
+            --arg repository "${REPOSITORY}" \
+            --argjson number "${PR_NUMBER}" \
+            --arg title "${{ github.event.pull_request.title }}" \
+            --arg head_ref "${{ github.event.pull_request.head.ref }}" \
+            --arg action "${TRIGGER_ACTION}" \
+            '{
+              provider: $provider,
+              repository: $repository,
+              pull_request: {
+                number: $number,
+                title: $title,
+                head_ref: $head_ref
+              },
+              action: $action,
+              source: "github_actions"
+            }')
+
+          echo "Triggering CoReview for ${REPOSITORY}#${PR_NUMBER} (action=${ACTION})"
+
+          HTTP_CODE=$(curl -sS -o /tmp/coreview-response.json -w "%{http_code}" \
+            -X POST "${COREVIEW_API_URL}/api/v1/reviews/external/trigger" \
+            -H "Authorization: Bearer ${COREVIEW_TRIGGER_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}")
+
+          echo "HTTP ${HTTP_CODE}"
+          cat /tmp/coreview-response.json
+
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            echo "CoReview trigger failed"
+            exit 1
+          fi
